@@ -72,13 +72,24 @@ def fetch_matches_for(endpoint, max_pages, videogame_slug=None):
 
 
 def fetch_upcoming_matches():
-    """Récupère les matchs à venir ET les matchs actuellement en direct, jeu par jeu pour
-    garantir que chaque jeu suivi a sa propre fenêtre de résultats (voir GAME_SLUGS)."""
+    """Récupère les matchs à venir ET les matchs actuellement en direct.
+
+    Deux stratégies combinées, car le filtre par jeu de PandaScore (filter[videogame])
+    ne répond pas de façon fiable pour tous les jeux (marche pour mlbb/ow/dota-2/valorant/
+    cs-go/lol, mais renvoie vide pour cod-mw/teamfight-tactics/rocket-league sans erreur) :
+    1. Un appel filtré par jeu pour chaque jeu suivi (rapide, garantit les jeux où ça marche).
+    2. Un appel global plus profond (10 pages = jusqu'à 1000 matchs tous jeux confondus) en
+       filet de sécurité, pour les jeux dont le filtre échoue silencieusement.
+    Les deux résultats sont fusionnés et dédoublonnés par id de match plus loin dans le code."""
     running = fetch_matches_for("running", max_pages=2)  # peu de matchs en direct à un instant T, tous jeux confondus
-    upcoming = []
+
+    per_game = []
     for slug in GAME_SLUGS:
-        upcoming.extend(fetch_matches_for("upcoming", max_pages=1, videogame_slug=slug))  # jusqu'à 100 matchs à venir par jeu
-    return running + upcoming
+        per_game.extend(fetch_matches_for("upcoming", max_pages=1, videogame_slug=slug))
+
+    global_fallback = fetch_matches_for("upcoming", max_pages=10)  # filet de sécurité, jusqu'à 1000 matchs
+
+    return running + per_game + global_fallback
 
 
 def fetch_fortnite_live_tournaments():
