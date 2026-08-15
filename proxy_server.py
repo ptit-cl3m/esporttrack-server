@@ -15,7 +15,9 @@ Comment l'utiliser :
 import json
 import os
 import time
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # La clé est lue depuis une variable d'environnement PANDASCORE_TOKEN.
@@ -48,8 +50,13 @@ _cito_cache = {"data": None, "timestamp": 0}
 # hors de portée, qui semblaient alors "vides" alors qu'ils avaient bien des matchs.
 GAME_SLUGS = [
     "league-of-legends", "cs-go", "valorant", "cod-mw",
-    "dota-2", "ow", "teamfight-tactics", "rocket-league", "mlbb",
+    "dota-2", "ow", "teamfight-tactics", "rl", "mlbb",
 ]
+
+# Petit cache pour la recherche d'équipes (voir /api/teams) : évite de rappeler PandaScore
+# à chaque frappe si quelqu'un retape la même recherche peu après.
+TEAM_SEARCH_CACHE_SECONDS = 5 * 60
+_team_search_cache = {}  # clé "requete|jeux" -> {"data": [...], "timestamp": ...}
 
 
 def fetch_matches_for(endpoint, max_pages, videogame_slug=None):
@@ -120,6 +127,58 @@ def fetch_fortnite_live_tournaments():
     return normalized
 
 
+def fetch_teams_for_slug(query, slug):
+    """Recherche les équipes d'un jeu donné dont le nom correspond à `query`, directement
+    chez PandaScore (endpoint /teams, indépendant des matchs). Permet de trouver une
+    organisation même si elle n'a aucun match programmé en ce moment (contrairement à
+    /api/matches, qui ne connaît que les équipes ayant un match à venir/en cours)."""
+    url = (
+        "https://api.pandascore.co/teams"
+        f"?token={PANDASCORE_TOKEN}&per_page=15"
+        f"&search[name]={urllib.parse.quote(query)}"
+        f"&filter[videogame]={slug}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []  # un jeu qui échoue ne doit pas faire échouer toute la recherche
+    results = []
+    for team in data:
+        if not team.get("name"):
+            continue
+        results.append({
+            "id": team.get("id"),
+            "name": team.get("name"),
+            "image_url": team.get("image_url"),
+            "dark_mode_image_url": None,  # PandaScore ne fournit pas de variante sombre pour /teams
+            "videogame_slug": slug,
+        })
+    return results
+
+
+def search_teams(query, slugs):
+    """Cherche `query` en parallèle sur tous les jeux demandés (un appel PandaScore par jeu),
+    avec un petit cache pour éviter de rappeler PandaScore si la même recherche revient
+    rapidement (ex: l'utilisateur retape en arrière puis en avant)."""
+    cache_key = query.lower() + "|" + ",".join(sorted(slugs))
+    now = time.time()
+    cached = _team_search_cache.get(cache_key)
+    if cached and (now - cached["timestamp"]) < TEAM_SEARCH_CACHE_SECONDS:
+        return cached["data"]
+
+    with ThreadPoolExecutor(max_workers=max(1, len(slugs))) as pool:
+        per_slug_results = pool.map(lambda s: fetch_teams_for_slug(query, s), slugs)
+    combined = [team for sub in per_slug_results for team in sub]
+
+    _team_search_cache[cache_key] = {"data": combined, "timestamp": now}
+    # Petit ménage pour ne pas laisser le cache grossir indéfiniment sur un serveur qui tourne des jours.
+    if len(_team_search_cache) > 200:
+        oldest_key = min(_team_search_cache, key=lambda k: _team_search_cache[k]["timestamp"])
+        del _team_search_cache[oldest_key]
+    return combined
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")
@@ -163,6 +222,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": str(e)}, status=500)
                     return
             self._send_json(_cito_cache["data"])
+        elif self.path.startswith("/api/teams"):
+            if not PANDASCORE_TOKEN:
+                self._send_json({"error": "PANDASCORE_TOKEN manquant (variable d'environnement non définie)."}, status=500)
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            query = (params.get("q", [""])[0] or "").strip()
+            games_param = (params.get("games", [""])[0] or "").strip()
+            slugs = [s for s in games_param.split(",") if s] or GAME_SLUGS
+            if len(query) < 2:
+                self._send_json([])  # évite de spammer PandaScore pour 0-1 caractère
+                return
+            try:
+                self._send_json(search_teams(query, slugs))
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
         else:
             self._send_json({"error": "Route inconnue"}, status=404)
 
