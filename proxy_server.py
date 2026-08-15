@@ -53,6 +53,22 @@ GAME_SLUGS = [
     "dota-2", "ow", "teamfight-tactics", "rl", "mlbb",
 ]
 
+# Contrairement à /matches, PandaScore n'a PAS de filtre "videogame" générique sur /teams :
+# chaque jeu a sa propre route dédiée (ex: /lol/teams, /csgo/teams, /rl/teams...). Cette table
+# fait le lien entre nos slugs internes (GAME_SLUGS, utilisés pour /matches) et le préfixe
+# d'URL PandaScore correspondant pour les équipes. Un jeu absent de cette table (ex: Teamfight
+# Tactics, qui n'a pas d'endpoint dédié chez PandaScore) est simplement ignoré par la recherche.
+TEAMS_ENDPOINT_PREFIX = {
+    "league-of-legends": "lol",
+    "cs-go": "csgo",
+    "valorant": "valorant",
+    "cod-mw": "codmw",
+    "dota-2": "dota2",
+    "ow": "ow",
+    "rl": "rl",
+    "mlbb": "mlbb",
+}
+
 # Petit cache pour la recherche d'équipes (voir /api/teams) : évite de rappeler PandaScore
 # à chaque frappe si quelqu'un retape la même recherche peu après.
 TEAM_SEARCH_CACHE_SECONDS = 5 * 60
@@ -129,14 +145,16 @@ def fetch_fortnite_live_tournaments():
 
 def fetch_teams_for_slug(query, slug):
     """Recherche les équipes d'un jeu donné dont le nom correspond à `query`, directement
-    chez PandaScore (endpoint /teams, indépendant des matchs). Permet de trouver une
+    chez PandaScore (route dédiée au jeu, indépendante des matchs). Permet de trouver une
     organisation même si elle n'a aucun match programmé en ce moment (contrairement à
     /api/matches, qui ne connaît que les équipes ayant un match à venir/en cours)."""
+    prefix = TEAMS_ENDPOINT_PREFIX.get(slug)
+    if not prefix:
+        return []  # jeu sans route "teams" dédiée chez PandaScore (ex: Teamfight Tactics)
     url = (
-        "https://api.pandascore.co/teams"
+        f"https://api.pandascore.co/{prefix}/teams"
         f"?token={PANDASCORE_TOKEN}&per_page=15"
         f"&search[name]={urllib.parse.quote(query)}"
-        f"&filter[videogame]={slug}"
     )
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
